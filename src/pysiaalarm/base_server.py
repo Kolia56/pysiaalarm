@@ -96,15 +96,14 @@ class BaseSIAServer(ABC):
 
         Handles multi-frame TCP packets by splitting them and processing each
         frame individually. Some panels (e.g. Ajax Hub, Dahua Airshield)
-        concatenate multiple SIA frames in a single TCP packet.
+        concatenate multiple SIA frames in a single TCP packet, with only the
+        last frame carrying the \\r terminator expected by read_until().
 
         Args:
             data (bytes): Raw bytes received from the TCP stream.
 
         Returns:
-            SIAEvent: The SIAEvent type of the parsed line.
-            ResponseType: The response to send to the alarm.
-
+            EventsType | None: The last successfully parsed event, or None.
         """
         line = str.strip(data.decode("ascii", errors="ignore"))
         if not line:
@@ -123,11 +122,17 @@ class BaseSIAServer(ABC):
     def _parse_single_frame(self, line: str) -> EventsType | None:
         """Parse and check a single SIA/ADM frame.
 
+        Frames that do not match any known SIA format (e.g. Ajax NULL/0000
+        supervisory heartbeats) are logged at DEBUG level and skipped, rather
+        than raising a WARNING for every heartbeat. According to the official
+        SIA Java library, NULL with empty content [] is valid SIA, so this
+        is a parser limitation rather than a protocol violation.
+
         Args:
             line (str): A single decoded SIA frame string.
 
         Returns:
-            EventsType | None: The parsed event, or None if the line is empty.
+            EventsType | None: The parsed event, or None if the frame is empty.
         """
         self.log_and_count(COUNTER_EVENTS, line=line)
         try:
@@ -136,8 +141,16 @@ class BaseSIAServer(ABC):
             self.log_and_count(COUNTER_ACCOUNT, line, exception=exc)
             return NAKEvent()
         except EventFormatError as exc:
-            self.log_and_count(COUNTER_FORMAT, line, exception=exc)
-            return NAKEvent()
+            # Log at DEBUG instead of WARNING: some panels (notably Ajax Hub)
+            # send supervisory frames using valid SIA format (NULL/0000 with
+            # empty content) that the current regex does not yet recognise.
+            # These should not flood the logs as errors.
+            _LOGGER.debug(
+                "Frame could not be parsed, skipping: %s — %s",
+                line,
+                exc.args[0] if exc.args else exc,
+            )
+            return None
 
         if isinstance(event, OHEvent):
             return event  # pragma: no cover
